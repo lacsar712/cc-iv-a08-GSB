@@ -13,6 +13,7 @@ from db import SCHEMA, connect
 from rules import judge
 
 SECRET = os.environ.get("JWT_SECRET", "pvivscan-dev-secret")
+GOLDEN_WINDOW = timedelta(minutes=10)
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 USERS = {
     "scanner": {"role": "writer", "password_hash": pwd.hash("scan123456")},
@@ -31,6 +32,13 @@ def dump(row):
 def seed():
     with connect() as conn:
         conn.execute(SCHEMA)
+        # 逆变器启动时刻：整窗只钉这一次，进程重启也不重开黄金窗。
+        conn.execute(
+            """INSERT INTO app_meta (meta_key, meta_value)
+               VALUES ('inverter_booted_at', %s)
+               ON CONFLICT (meta_key) DO NOTHING""",
+            (datetime.now(timezone.utc),),
+        )
         n = conn.execute("SELECT COUNT(*) AS n FROM iv_scans").fetchone()["n"]
         if n == 0:
             now = datetime.now(timezone.utc)
@@ -141,4 +149,126 @@ async def create_log(request: Request) -> dict:
         return dump(row)
 
 
-app = Litestar(route_handlers=[health, login, list_logs, create_log])
+def _aware(val):
+    return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+
+
+@get("/api/golden/state")
+async def golden_state(request: Request) -> dict:
+    need_login(request)
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        booted = _aware(
+            conn.execute(
+                "SELECT meta_value FROM app_meta WHERE meta_key = 'inverter_booted_at'"
+            ).fetchone()["meta_value"]
+        )
+        closes_at = booted + GOLDEN_WINDOW
+        in_flight = conn.execute(
+            """SELECT id, string_code, voc_v, isc_a, fill_factor, created_by, created_at
+               FROM iv_scans WHERE status = 'pending' ORDER BY id"""
+        ).fetchall()
+        albums = conn.execute(
+            """SELECT id, window_name, sealed_by, sealed_at, window_opened_at, point_count
+               FROM golden_albums ORDER BY id DESC"""
+        ).fetchall()
+        return {
+            "window_opened_at": booted.isoformat(),
+            "window_closes_at": closes_at.isoformat(),
+            "server_now": now.isoformat(),
+            "in_window": now < closes_at,
+            "in_flight": [dump(r) for r in in_flight],
+            "albums": [dump(r) for r in albums],
+        }
+
+
+@get("/api/golden/albums/{album_id:int}")
+async def get_golden_album(request: Request, album_id: int) -> dict:
+    need_login(request)
+    with connect() as conn:
+        album = conn.execute(
+            "SELECT * FROM golden_albums WHERE id = %s", (album_id,)
+        ).fetchone()
+        if album is None:
+            raise HTTPException(status_code=404, detail="曲线册不存在")
+        points = conn.execute(
+            """SELECT id, scan_id, string_code, voc_v, isc_a, fill_factor,
+                      reading_created_at, captured_at
+               FROM golden_album_points WHERE album_id = %s ORDER BY id""",
+            (album_id,),
+        ).fetchall()
+        out = dump(album)
+        out["points"] = [dump(p) for p in points]
+        return out
+
+
+@post("/api/golden/seal", status_code=201)
+async def seal_golden_album(request: Request) -> dict:
+    user = need_login(request)
+    if user["role"] != "writer":
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅扫描员可封存黄金窗曲线册")
+    data = await request.json()
+    name = (data.get("window_name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="窗名不能为空")
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        try:
+            with conn.transaction():
+                booted = _aware(
+                    conn.execute(
+                        "SELECT meta_value FROM app_meta WHERE meta_key = 'inverter_booted_at'"
+                    ).fetchone()["meta_value"]
+                )
+                if now >= booted + GOLDEN_WINDOW:
+                    raise HTTPException(status_code=400, detail="黄金窗已关闭，无法封存")
+                # 行锁与工人的办结互斥：封存瞬间不会有在途单被刮走或漏抄。
+                rows = conn.execute(
+                    """SELECT id, string_code, voc_v, isc_a, fill_factor, created_at
+                       FROM iv_scans WHERE status = 'pending' ORDER BY id
+                       FOR UPDATE"""
+                ).fetchall()
+                if not rows:
+                    raise HTTPException(status_code=400, detail="此刻没有在途读数，无法封存曲线册")
+                album = conn.execute(
+                    """INSERT INTO golden_albums
+                       (window_name, sealed_by, sealed_at, window_opened_at, point_count)
+                       VALUES (%s,%s,%s,%s,%s) RETURNING *""",
+                    (name, user["username"], now, booted, len(rows)),
+                ).fetchone()
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        """INSERT INTO golden_album_points
+                           (album_id, scan_id, string_code, voc_v, isc_a, fill_factor,
+                            reading_created_at, captured_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        [
+                            (
+                                album["id"], r["id"], r["string_code"], r["voc_v"],
+                                r["isc_a"], r["fill_factor"], r["created_at"], now,
+                            )
+                            for r in rows
+                        ],
+                    )
+        except HTTPException:
+            raise
+        conn.commit()
+        out = dump(album)
+        out["points"] = [
+            {
+                "scan_id": r["id"], "string_code": r["string_code"],
+                "voc_v": r["voc_v"], "isc_a": r["isc_a"],
+                "fill_factor": r["fill_factor"],
+                "reading_created_at": r["created_at"].isoformat()
+                if hasattr(r["created_at"], "isoformat") else r["created_at"],
+                "captured_at": now.isoformat(),
+            }
+            for r in rows
+        ]
+        return out
+
+
+app = Litestar(route_handlers=[
+    health, login, list_logs, create_log,
+    golden_state, get_golden_album, seal_golden_album,
+])

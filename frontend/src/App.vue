@@ -1,5 +1,9 @@
 <template>
   <main>
+    <nav v-if="session" class="topbar">
+      <button class="tab" :class="{ active: page === 'scan' }" @click="page = 'scan'">扫描台</button>
+      <button class="tab" :class="{ active: page === 'golden' }" @click="page = 'golden'">黄金窗专页</button>
+    </nav>
     <h1>光伏组串IV扫描台</h1>
     <div v-if="!session">
       <p class="sub">扫描员提交开路电压、短路电流与填充因子；通知通道叫醒工人出结论。登录框已预填可写账号 scanner / scan123456。</p>
@@ -16,6 +20,8 @@
         <button class="secondary" @click="logout">退出</button>
         <button class="secondary" @click="refresh">刷新列表</button>
       </section>
+      <GoldenWindow v-if="page === 'golden'" :session="session" />
+      <template v-else>
       <section v-if="isWriter">
         <label>组串编号</label><input v-model="stringCode" placeholder="例如 阵列C-串05" />
         <label>开路电压 V</label><input type="number" step="0.1" v-model="voc" />
@@ -42,13 +48,16 @@
           </tbody>
         </table>
       </section>
+      </template>
     </div>
   </main>
 </template>
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import GoldenWindow from "./GoldenWindow.vue";
 const session = ref(null);
 const logs = ref([]);
+const page = ref("scan");
 const loginUser = ref("scanner");
 const loginPass = ref("scan123456");
 const stringCode = ref("");
@@ -128,6 +137,9 @@ onUnmounted(() => { if (timer) clearInterval(timer); });
 <style>
 body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; background: #052e16; color: #ecfdf5; }
 main { max-width: 980px; margin: 0 auto; padding: 1.5rem; }
+.topbar { display: flex; gap: 0.5rem; margin-bottom: 1rem; border-bottom: 1px solid #166534; }
+.tab { background: transparent; color: #a7f3d0; border-radius: 6px 6px 0 0; border: 1px solid transparent; border-bottom: none; padding: 0.5rem 1.1rem; }
+.tab.active { background: #14532d; border-color: #166534; color: #86efac; font-weight: 700; }
 h1 { color: #86efac; margin: 0 0 0.25rem; }
 .sub { color: #a7f3d0; margin-bottom: 1.25rem; }
 section { background: #14532d; border: 1px solid #166534; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1rem; }

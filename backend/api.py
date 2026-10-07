@@ -141,4 +141,58 @@ async def create_log(request: Request) -> dict:
         return dump(row)
 
 
-app = Litestar(route_handlers=[health, login, list_logs, create_log])
+@get("/api/golden-window/books")
+async def list_books(request: Request) -> list:
+    need_login(request)
+    with connect() as conn:
+        books = conn.execute(
+            "SELECT id, name, created_by, created_at FROM curve_books ORDER BY id DESC"
+        ).fetchall()
+        pts = conn.execute(
+            """SELECT id, book_id, scan_id, string_code, voc_v, isc_a, fill_factor, seq
+               FROM curve_points ORDER BY book_id, seq"""
+        ).fetchall()
+    by_book = {}
+    for p in pts:
+        by_book.setdefault(p["book_id"], []).append(dump(p))
+    return [{**dump(b), "points": by_book.get(b["id"], [])} for b in books]
+
+
+@post("/api/golden-window/seal", status_code=201)
+async def seal_book(request: Request) -> dict:
+    user = need_login(request)
+    if user["role"] != "writer":
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="观察员只能翻阅曲线册，不能封存")
+    data = await request.json()
+    name = (data.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="册名不能为空，册名和点列缺一边整页不算完工")
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT id, string_code, voc_v, isc_a, fill_factor
+               FROM iv_scans WHERE status = 'pending' ORDER BY id"""
+        ).fetchall()
+        if not rows:
+            raise HTTPException(status_code=400, detail="此刻没有在途曲线，册名和点列缺一边整页不算完工")
+        book = conn.execute(
+            """INSERT INTO curve_books (name, created_by, created_at)
+               VALUES (%s,%s,%s)
+               RETURNING id, name, created_by, created_at""",
+            (name, user["username"], now),
+        ).fetchone()
+        points = []
+        for seq, r in enumerate(rows):
+            p = conn.execute(
+                """INSERT INTO curve_points
+                   (book_id, scan_id, string_code, voc_v, isc_a, fill_factor, seq)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s)
+                   RETURNING id, book_id, scan_id, string_code, voc_v, isc_a, fill_factor, seq""",
+                (book["id"], r["id"], r["string_code"], r["voc_v"], r["isc_a"], r["fill_factor"], seq),
+            ).fetchone()
+            points.append(dump(p))
+        conn.commit()
+        return {**dump(book), "points": points}
+
+
+app = Litestar(route_handlers=[health, login, list_logs, create_log, list_books, seal_book])

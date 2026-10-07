@@ -33,4 +33,20 @@ DROP TRIGGER IF EXISTS trg_iv_scan_notify ON iv_scans;
 CREATE TRIGGER trg_iv_scan_notify
 AFTER INSERT ON iv_scans
 FOR EACH ROW EXECUTE FUNCTION notify_iv_scan();
+CREATE TABLE IF NOT EXISTS curve_books (
+    id serial PRIMARY KEY,
+    name text NOT NULL,
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL
+);
+CREATE TABLE IF NOT EXISTS curve_points (
+    id serial PRIMARY KEY,
+    book_id integer NOT NULL REFERENCES curve_books(id) ON DELETE CASCADE,
+    scan_id integer,
+    string_code text NOT NULL,
+    voc_v double precision NOT NULL,
+    isc_a double precision NOT NULL,
+    fill_factor double precision NOT NULL,
+    seq integer NOT NULL
+);
 """
